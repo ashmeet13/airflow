@@ -37,6 +37,9 @@ With this change a task will fail if it recieves any undefined variables.
 """
 
     def check_rendered_content(self, rendered_content):
+        """Replicates the logic in BaseOperator.render_template() to
+        cover all the cases needed to be checked.
+        """
         if isinstance(rendered_content, six.string_types):
             return set(re.findall(r"{{(.*?)}}", rendered_content))
 
