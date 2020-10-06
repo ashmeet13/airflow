@@ -22,6 +22,7 @@ import re
 import jinja2
 import six
 
+from airflow import conf
 from airflow.models import DagBag, TaskInstance
 from airflow.upgrade.rules.base_rule import BaseRule
 from airflow.utils import timezone
@@ -36,7 +37,7 @@ Jinja Templates have been updated to the following rule - jinja2.StrictUndefined
 With this change a task will fail if it recieves any undefined variables.
 """
 
-    def check_rendered_content(self, rendered_content):
+    def _check_rendered_content(self, rendered_content):
         """Replicates the logic in BaseOperator.render_template() to
         cover all the cases needed to be checked.
         """
@@ -44,49 +45,77 @@ With this change a task will fail if it recieves any undefined variables.
             return set(re.findall(r"{{(.*?)}}", rendered_content))
 
         elif isinstance(rendered_content, (tuple, list, set)):
-            parsed_templates = set()
+            debug_error_messages = set()
             for element in rendered_content:
-                parsed_templates.union(self.check_rendered_content(element))
-            return parsed_templates
+                debug_error_messages.union(self._check_rendered_content(element))
+            return debug_error_messages
 
         elif isinstance(rendered_content, dict):
-            parsed_templates = set()
+            debug_error_messages = set()
             for key, value in rendered_content.items():
-                parsed_templates.union(self.check_rendered_content(str(value)))
-            return parsed_templates
+                debug_error_messages.union(self._check_rendered_content(str(value)))
+            return debug_error_messages
 
-    def check(self, dagbag=DagBag()):
+    def _render_task_content(self, task, content, context):
+        completed_rendering = False
+        errors_while_rendering = []
+        while not completed_rendering:
+            # Catch errors such as {{ object.element }} where
+            # object is not defined
+            try:
+                renderend_content = task.render_template(content, context)
+                completed_rendering = True
+            except Exception as e:
+                undefined_variable = re.sub(" is undefined", "", str(e))
+                undefined_variable = re.sub("'", "", undefined_variable)
+                context[undefined_variable] = dict()
+                message = "Could not find the object '{}'".format(undefined_variable)
+                errors_while_rendering.append(message)
+        return renderend_content, errors_while_rendering
+
+    def _task_level_(self, task):
+        messages = {}
+        task_instance = TaskInstance(task=task, execution_date=timezone.utcnow())
+        context = task_instance.get_template_context()
+        for attr_name in task.template_fields:
+            content = getattr(task, attr_name)
+            if content:
+                rendered_content, errors_while_rendering = self._render_task_content(
+                    task, content, context
+                )
+                debug_error_messages = list(
+                    self._check_rendered_content(rendered_content)
+                )
+                messages[attr_name] = errors_while_rendering + debug_error_messages
+
+        return messages
+
+    def _dag_level_(self, dag):
+        dag.template_undefined = jinja2.DebugUndefined
+        tasks = dag.tasks
+        messages = {}
+        for task in tasks:
+            error_messages = self._task_level_(task)
+            messages[task.task_id] = error_messages
+        return messages
+
+    def check(self, dagbag=None):
+        if not dagbag:
+            dag_folder = conf.get("core", "dags_folder")
+            dagbag = DagBag(dag_folder)
         dags = dagbag.dags
         messages = []
         for dag_id, dag in dags.items():
-            bracket_pattern = r"\[(.*?)\]"
-            dag.template_undefined = jinja2.DebugUndefined
-            for task in dag.tasks:
-                task_instance = TaskInstance(
-                    task=task, execution_date=timezone.utcnow()
-                )
-                template_context = task_instance.get_template_context()
+            dag_messages = self._dag_level_(dag)
 
-                rendered_content_collection = []
-
-                for attr_name in task.template_fields:
-                    content = getattr(task, attr_name)
-                    if content:
-                        rendered_content_collection.append(
-                            task.render_template(content, template_context)
-                        )
-
-                for rendered_content in rendered_content_collection:
-                    undefined_variables = self.check_rendered_content(rendered_content)
-                    for undefined_variable in undefined_variables:
-                        result = re.findall(bracket_pattern, undefined_variable)
-                        if result:
-                            undefined_variable = result[0].strip("'")
-                        new_msg = (
-                            "Possible Undefined Jinja Variable -> DAG: {}, Task: {}, "
-                            "Variable: {}".format(
-                                dag_id, task.task_id, undefined_variable.strip()
+            for task_id, task_messages in dag_messages.items():
+                for attr_name, error_messages in task_messages.items():
+                    for error_message in error_messages:
+                        message = (
+                            "Possible UndefinedJinjaVariable -> DAG: {}, Task: {}, "
+                            "Attribute: {}, Error: {}".format(
+                                dag_id, task_id, attr_name, error_message.strip()
                             )
                         )
-                        messages.append(new_msg)
+                        messages.append(message)
         return messages
