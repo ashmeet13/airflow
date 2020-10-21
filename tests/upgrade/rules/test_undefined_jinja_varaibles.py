@@ -26,21 +26,61 @@ from airflow.upgrade.rules.undefined_jinja_varaibles import \
 from tests.models import DEFAULT_DATE
 
 
-class TestConnTypeIsNotNullableRule(TestCase):
+class ClassWithCustomAttributes:
+    """Class for testing purpose: allows to create objects with custom attributes in one single statement."""
+
+    def __init__(self, **kwargs):
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+    def __str__(self):
+        return "{}({})".format(ClassWithCustomAttributes.__name__, str(self.__dict__))
+
+    def __repr__(self):
+        return self.__str__()
+
+    def __eq__(self, other):
+        return self.__dict__ == other.__dict__
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+
+class TestUndefinedJinjaVariablesRule(TestCase):
     @classmethod
     def setUpClass(cls):
         cls.empty_dir = mkdtemp()
 
-    def setUp(self):
-
-        self.invalid_dag = DAG(
-            dag_id="test-undefined-jinja-variables", start_date=DEFAULT_DATE
-        )
+    def setUpValidDag(self):
         self.valid_dag = DAG(
             dag_id="test-defined-jinja-variables", start_date=DEFAULT_DATE
         )
 
-        template_command = """
+        BashOperator(
+            task_id="templated_string",
+            depends_on_past=False,
+            bash_command="echo",
+            env={
+                "integer": "{{ params.integer }}",
+                "float": "{{ params.float }}",
+                "string": "{{ params.string }}",
+                "boolean": "{{ params.boolean }}",
+            },
+            params={
+                "integer": 1,
+                "float": 1.0,
+                "string": "test_string",
+                "boolean": True,
+            },
+            dag=self.valid_dag,
+        )
+
+    def setUpInvalidDag(self):
+        self.invalid_dag = DAG(
+            dag_id="test-undefined-jinja-variables", start_date=DEFAULT_DATE
+        )
+
+        invalid_template_command = """
             {% for i in range(5) %}
                 echo "{{ params.defined_variable }}"
                 echo "{{ execution_date.today }}"
@@ -50,25 +90,31 @@ class TestConnTypeIsNotNullableRule(TestCase):
             {% endfor %}
             """
 
-        BashOperator(
-            task_id="templated_string",
-            depends_on_past=False,
-            bash_command=template_command,
-            env={"undefined_object": "{{ undefined_object.element }}"},
-            params={"defined_variable": "defined_value"},
-            dag=self.invalid_dag,
+        nested_validation = ClassWithCustomAttributes(
+            nested1=ClassWithCustomAttributes(
+                att1="{{ nested.undefined }}", template_fields=["att1"]
+            ),
+            nested2=ClassWithCustomAttributes(
+                att2="{{ bar }}", template_fields=["att2"]
+            ),
+            template_fields=["nested1", "nested2"],
         )
 
         BashOperator(
             task_id="templated_string",
             depends_on_past=False,
-            bash_command="echo",
-            env={"defined_object": "{{ params.element }}"},
-            params={
-                "element": "defined_value",
+            bash_command=invalid_template_command,
+            env={
+                "undefined_object": "{{ undefined_object.element }}",
+                "nested_object": nested_validation,
             },
-            dag=self.valid_dag,
+            params={"defined_variable": "defined_value"},
+            dag=self.invalid_dag,
         )
+
+    def setUp(self):
+        self.setUpValidDag()
+        self.setUpInvalidDag()
 
     def test_invalid_check(self):
         dagbag = DagBag(dag_folder=self.empty_dir, include_examples=False)
@@ -82,9 +128,6 @@ class TestConnTypeIsNotNullableRule(TestCase):
 
         expected_messages = [
             "Possible UndefinedJinjaVariable -> DAG: test-undefined-jinja-variables, "
-            "Task: templated_string, Attribute: env, Error: Could not find the "
-            "object 'undefined_object",
-            "Possible UndefinedJinjaVariable -> DAG: test-undefined-jinja-variables, "
             "Task: templated_string, Attribute: bash_command, Error: no such element: "
             "dict object['undefined_variable']",
             "Possible UndefinedJinjaVariable -> DAG: test-undefined-jinja-variables, "
@@ -92,8 +135,22 @@ class TestConnTypeIsNotNullableRule(TestCase):
             "pendulum.pendulum.Pendulum object['invalid_element']",
             "Possible UndefinedJinjaVariable -> DAG: test-undefined-jinja-variables, "
             "Task: templated_string, Attribute: bash_command, Error: foo",
+            "Possible UndefinedJinjaVariable -> DAG: test-undefined-jinja-variables, "
+            "Task: templated_string, Attribute: env, Error: Could not find the "
+            "object 'undefined_object",
+            "Possible UndefinedJinjaVariable -> DAG: test-undefined-jinja-variables, "
+            "Task: templated_string, Attribute: env, Error: Could not find the object 'nested'",
+            "Possible UndefinedJinjaVariable -> DAG: test-undefined-jinja-variables, "
+            "Task: templated_string, Attribute: env, Error: bar  NestedTemplateField=att2 "
+            "NestedTemplateField=nested2",
+            "Possible UndefinedJinjaVariable -> DAG: test-undefined-jinja-variables, "
+            "Task: templated_string, Attribute: env, Error: no such element: "
+            "dict object['undefined']  NestedTemplateField=att1 NestedTemplateField=nested1",
+            "Possible UndefinedJinjaVariable -> DAG: test-undefined-jinja-variables, "
+            "Task: templated_string, Attribute: env, Error: no such element: dict object['element']",
         ]
 
+        assert len(messages) == len(expected_messages)
         assert [m for m in messages if m in expected_messages], len(messages) == len(
             expected_messages
         )

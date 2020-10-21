@@ -37,7 +37,7 @@ Jinja Templates have been updated to the following rule - jinja2.StrictUndefined
 With this change a task will fail if it recieves any undefined variables.
 """
 
-    def _check_rendered_content(self, rendered_content):
+    def _check_rendered_content(self, rendered_content, seen_oids=None):
         """Replicates the logic in BaseOperator.render_template() to
         cover all the cases needed to be checked.
         """
@@ -47,14 +47,37 @@ With this change a task will fail if it recieves any undefined variables.
         elif isinstance(rendered_content, (tuple, list, set)):
             debug_error_messages = set()
             for element in rendered_content:
-                debug_error_messages.union(self._check_rendered_content(element))
+                debug_error_messages.update(self._check_rendered_content(element))
             return debug_error_messages
 
         elif isinstance(rendered_content, dict):
             debug_error_messages = set()
             for key, value in rendered_content.items():
-                debug_error_messages.union(self._check_rendered_content(str(value)))
+                debug_error_messages.update(self._check_rendered_content(value))
             return debug_error_messages
+
+        else:
+            if seen_oids is None:
+                seen_oids = set()
+            return self._nested_check_rendered(rendered_content, seen_oids)
+
+    def _nested_check_rendered(self, rendered_content, seen_oids):
+        debug_error_messages = set()
+        if id(rendered_content) not in seen_oids:
+            seen_oids.add(id(rendered_content))
+            nested_template_fields = rendered_content.template_fields
+            for attr_name in nested_template_fields:
+                nested_rendered_content = getattr(rendered_content, attr_name)
+
+                if nested_rendered_content:
+                    errors = list(
+                        self._check_rendered_content(nested_rendered_content, seen_oids)
+                    )
+                    for i in range(len(errors)):
+                        errors[i].strip()
+                        errors[i] += " NestedTemplateField={}".format(attr_name)
+                    debug_error_messages.update(errors)
+        return debug_error_messages
 
     def _render_task_content(self, task, content, context):
         completed_rendering = False
@@ -73,7 +96,7 @@ With this change a task will fail if it recieves any undefined variables.
                 errors_while_rendering.append(message)
         return renderend_content, errors_while_rendering
 
-    def _task_level_(self, task):
+    def iterate_over_template_fields(self, task):
         messages = {}
         task_instance = TaskInstance(task=task, execution_date=timezone.utcnow())
         context = task_instance.get_template_context()
@@ -84,18 +107,18 @@ With this change a task will fail if it recieves any undefined variables.
                     task, content, context
                 )
                 debug_error_messages = list(
-                    self._check_rendered_content(rendered_content)
+                    self._check_rendered_content(rendered_content, set())
                 )
                 messages[attr_name] = errors_while_rendering + debug_error_messages
 
         return messages
 
-    def _dag_level_(self, dag):
+    def iterate_over_dag_tasks(self, dag):
         dag.template_undefined = jinja2.DebugUndefined
         tasks = dag.tasks
         messages = {}
         for task in tasks:
-            error_messages = self._task_level_(task)
+            error_messages = self.iterate_over_template_fields(task)
             messages[task.task_id] = error_messages
         return messages
 
@@ -106,7 +129,7 @@ With this change a task will fail if it recieves any undefined variables.
         dags = dagbag.dags
         messages = []
         for dag_id, dag in dags.items():
-            dag_messages = self._dag_level_(dag)
+            dag_messages = self.iterate_over_dag_tasks(dag)
 
             for task_id, task_messages in dag_messages.items():
                 for attr_name, error_messages in task_messages.items():
